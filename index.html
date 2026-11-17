@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI Sign Language Translator</title>
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;font-family:Arial,sans-serif;background:#101827;color:#f4f7fb}
+  .wrap{max-width:1050px;margin:auto;padding:22px}
+  header{text-align:center;margin-bottom:20px}
+  h1{margin:8px 0;color:#7dd3fc;font-size:clamp(24px,4vw,36px)}
+  .sub{color:#b8c5d6}
+  .grid{display:grid;grid-template-columns:1.35fr 1fr;gap:18px}
+  .card{background:#1b2940;border:1px solid #31435f;border-radius:18px;padding:16px}
+  .stage{position:relative;width:100%;background:#080e18;border-radius:14px;overflow:hidden;min-height:260px}
+  video,canvas{display:block;width:100%;height:auto;transform:scaleX(-1)}
+  canvas{position:absolute;inset:0}
+  .controls{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}
+  button{border:0;border-radius:10px;padding:12px 17px;font-weight:bold;cursor:pointer}
+  #start{background:#38bdf8;color:#082033}
+  #stop{background:#475569;color:white}
+  #speak{background:#34d399;color:#06251a}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  .result{font-size:clamp(28px,5vw,44px);font-weight:800;color:#86efac;margin:10px 0}
+  .muted{color:#b8c5d6;line-height:1.5}
+  .pill{display:inline-block;background:#263b58;border-radius:999px;padding:7px 11px;margin:4px 3px;font-size:13px}
+  #status{margin-top:12px;color:#fcd34d;min-height:22px}
+  .note{font-size:13px;color:#aebbd0;line-height:1.55}
+  @media(max-width:760px){.grid{grid-template-columns:1fr}.wrap{padding:14px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>✋ AI Sign Language Translator</h1>
+    <div class="sub">Live hand-gesture recognition demo</div>
+  </header>
+
+  <div class="grid">
+    <section class="card">
+      <h2>Live Camera</h2>
+      <div class="stage">
+        <video id="video" playsinline autoplay muted></video>
+        <canvas id="canvas"></canvas>
+      </div>
+      <div class="controls">
+        <button id="start">Start Camera</button>
+        <button id="stop" disabled>Stop Camera</button>
+      </div>
+      <div id="status">Press “Start Camera” and allow camera permission.</div>
+    </section>
+
+    <section class="card">
+      <h2>Detected Gesture</h2>
+      <div id="gesture" class="result">Waiting…</div>
+      <p id="meaning" class="muted">Show one hand clearly in front of the camera.</p>
+      <div class="controls">
+        <button id="speak" disabled>🔊 Speak Result</button>
+      </div>
+      <h3>Supported demo gestures</h3>
+      <div>
+        <span class="pill">✋ Open palm = HELLO</span>
+        <span class="pill">✊ Fist = STOP</span>
+        <span class="pill">👍 Thumb up = GOOD</span>
+        <span class="pill">☝️ Index up = ONE</span>
+        <span class="pill">✌️ Two fingers = PEACE</span>
+      </div>
+      <p class="note"><b>Important:</b> This is an educational prototype that recognizes five simple hand poses using hand landmarks. It is not a complete sign-language translator and does not understand full sentences, facial expressions, or regional sign-language grammar.</p>
+    </section>
+  </div>
+</div>
+
+<script type="module">
+import { FilesetResolver, HandLandmarker, DrawingUtils }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+const video = document.getElementById("video");
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+const startBtn = document.getElementById("start");
+const stopBtn = document.getElementById("stop");
+const speakBtn = document.getElementById("speak");
+const statusEl = document.getElementById("status");
+const gestureEl = document.getElementById("gesture");
+const meaningEl = document.getElementById("meaning");
+
+let landmarker = null;
+let stream = null;
+let running = false;
+let lastVideoTime = -1;
+let lastGesture = "";
+
+const names = {
+  HELLO: "Hello! / नमस्ते",
+  STOP: "Stop / रुकिए",
+  GOOD: "Good / अच्छा",
+  ONE: "One / एक",
+  PEACE: "Peace / शांति"
+};
+
+async function setupModel() {
+  statusEl.textContent = "Loading hand-detection AI model…";
+  const vision = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+  );
+  landmarker = await HandLandmarker.createFromOptions(vision, {
+    baseOptions: {
+      modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+      delegate: "GPU"
+    },
+    runningMode: "VIDEO",
+    numHands: 1
+  });
+}
+
+function fingerUp(lm, tip, pip) {
+  // For a front-facing hand, fingertips are generally higher (smaller y)
+  // than the middle joint when the finger is extended.
+  return lm[tip].y < lm[pip].y - 0.035;
+}
+
+function classify(lm) {
+  const index = fingerUp(lm, 8, 6);
+  const middle = fingerUp(lm, 12, 10);
+  const ring = fingerUp(lm, 16, 14);
+  const pinky = fingerUp(lm, 20, 18);
+
+  // Thumb extension is approximated by distance from the index MCP.
+  const thumbExtended =
+    Math.hypot(lm[4].x - lm[5].x, lm[4].y - lm[5].y) >
+    Math.hypot(lm[3].x - lm[5].x, lm[3].y - lm[5].y) + 0.015;
+
+  if (index && middle && ring && pinky) return "HELLO";
+  if (!index && !middle && !ring && !pinky && thumbExtended) return "GOOD";
+  if (!index && !middle && !ring && !pinky) return "STOP"; // closed fist
+  if (index && !middle && !ring && !pinky) return "ONE";
+  if (index && middle && !ring && !pinky) return "PEACE";
+  return "Detecting…";
+}
+
+function drawHands(result) {
+  const w = video.videoWidth, h = video.videoHeight;
+  if (!w || !h) return;
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w; canvas.height = h;
+  }
+  ctx.clearRect(0, 0, w, h);
+  if (result.landmarks?.length) {
+    const utils = new DrawingUtils(ctx);
+    for (const landmarks of result.landmarks) {
+      utils.drawConnectors(landmarks, HandLandmarker.HAND_CONNECTIONS,
+        { color: "#38bdf8", lineWidth: 4 });
+      utils.drawLandmarks(landmarks, { color: "#f97316", lineWidth: 2, radius: 4 });
+    }
+  }
+}
+
+async function loop() {
+  if (!running) return;
+  if (video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    const result = landmarker.detectForVideo(video, performance.now());
+    drawHands(result);
+    if (result.landmarks?.length) {
+      const label = classify(result.landmarks[0]);
+      if (label !== "Detecting…" && label !== lastGesture) {
+        lastGesture = label;
+        gestureEl.textContent = label;
+        meaningEl.textContent = names[label];
+        speakBtn.disabled = false;
+      }
+      statusEl.textContent = "Hand detected. Try another supported gesture.";
+    } else {
+      lastGesture = "";
+      gestureEl.textContent = "No hand detected";
+      meaningEl.textContent = "Keep your hand visible, with good lighting.";
+      speakBtn.disabled = true;
+      statusEl.textContent = "Camera is running…";
+    }
+  }
+  requestAnimationFrame(loop);
+}
+
+startBtn.addEventListener("click", async () => {
+  try {
+    startBtn.disabled = true;
+    if (!landmarker) await setupModel();
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "user" }, audio: false
+    });
+    video.srcObject = stream;
+    await video.play();
+    running = true;
+    stopBtn.disabled = false;
+    statusEl.textContent = "Camera started. Show a supported hand pose.";
+    requestAnimationFrame(loop);
+  } catch (err) {
+    console.error(err);
+    statusEl.textContent = "Could not start camera. Use HTTPS or localhost and allow camera permission. " + err.message;
+    startBtn.disabled = false;
+  }
+});
+
+stopBtn.addEventListener("click", () => {
+  running = false;
+  if (stream) stream.getTracks().forEach(track => track.stop());
+  video.srcObject = null;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  startBtn.disabled = false;
+  stopBtn.disabled = true;
+  statusEl.textContent = "Camera stopped.";
+});
+
+speakBtn.addEventListener("click", () => {
+  const text = names[lastGesture] || lastGesture;
+  if ("speechSynthesis" in window && text) {
+    speechSynthesis.cancel();
+    speechSynthesis.speak(new SpeechSynthesisUtterance(text));
+  }
+});
+</script>
+</body>
+</html>
